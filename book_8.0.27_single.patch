@@ -1,0 +1,913 @@
+diff --git a/mysql-test/suite/group_replication/my.cnf b/mysql-test/suite/group_replication/my.cnf
+index 31bf8e5d..8e5361bc 100644
+--- a/mysql-test/suite/group_replication/my.cnf
++++ b/mysql-test/suite/group_replication/my.cnf
+@@ -15,6 +15,8 @@ report-user=                root
+ master-retry-count=         10
+ skip-replica-start
+ 
++binlog_checksum=CRC32
++
+ loose-group_replication_start_on_boot= OFF
+ loose-group_replication_single_primary_mode= FALSE
+ loose-group_replication_enforce_update_everywhere_checks= TRUE
+diff --git a/sql/binlog.cc b/sql/binlog.cc
+index 8ed0c91e..5e8b3e7e 100644
+--- a/sql/binlog.cc
++++ b/sql/binlog.cc
+@@ -8571,6 +8571,8 @@ void MYSQL_BIN_LOG::init_thd_variables(THD *thd, bool all, bool skip_commit) {
+   thd->tx_commit_pending = true;
+   thd->commit_error = THD::CE_NONE;
+   thd->next_to_commit = nullptr;
++  mysql_cond_init(0, &thd->thr_cond_lock);
++  thd->thr_cond_lock_inited = true;
+   thd->durability_property = HA_IGNORE_DURABILITY;
+   thd->get_transaction()->m_flags.real_commit = all;
+   thd->get_transaction()->m_flags.xid_written = false;
+diff --git a/sql/rpl_commit_stage_manager.cc b/sql/rpl_commit_stage_manager.cc
+index 97fa4468..7d2e9f0c 100644
+--- a/sql/rpl_commit_stage_manager.cc
++++ b/sql/rpl_commit_stage_manager.cc
+@@ -267,11 +267,7 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
+     if (leader_await_preempt_status) mysql_cond_signal(&m_cond_preempt);
+ #endif
+     while (thd->tx_commit_pending) {
+-      if (stage == COMMIT_ORDER_FLUSH_STAGE) {
+-        mysql_cond_wait(&m_stage_cond_commit_order, &m_lock_done);
+-      } else {
+-        mysql_cond_wait(&m_stage_cond_binlog, &m_lock_done);
+-      }
++      mysql_cond_wait(&thd->thr_cond_lock, &m_lock_done);
+     }
+ 
+     mysql_mutex_unlock(&m_lock_done);
+@@ -317,7 +313,7 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
+       CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP(
+           "before_commit_order_leader_waits_for_binlog_leader");
+       while (thd->tx_commit_pending)
+-        mysql_cond_wait(&m_stage_cond_commit_order, &m_lock_done);
++        mysql_cond_wait(&thd->thr_cond_lock, &m_lock_done);
+       mysql_mutex_unlock(&m_lock_done);
+ 
+       leader = false;
+@@ -399,19 +395,15 @@ void Commit_stage_manager::process_final_stage_for_ordered_commit_group(
+   }
+ }
+ 
+-void Commit_stage_manager::signal_done(THD *queue, StageID stage) {
++void Commit_stage_manager::signal_done(THD *queue,
++                                       StageID stage [[maybe_unused]]) {
+   mysql_mutex_lock(&m_lock_done);
+ 
+   for (THD *thd = queue; thd; thd = thd->next_to_commit) {
+     thd->tx_commit_pending = false;
++    mysql_cond_broadcast(&thd->thr_cond_lock);
+   }
+ 
+-  /* if thread belong to commit order wake only commit order queue threads */
+-  if (stage == COMMIT_ORDER_FLUSH_STAGE)
+-    mysql_cond_broadcast(&m_stage_cond_commit_order);
+-  else
+-    mysql_cond_broadcast(&m_stage_cond_binlog);
+-
+   mysql_mutex_unlock(&m_lock_done);
+ }
+ 
+diff --git a/sql/sql_class.cc b/sql/sql_class.cc
+index be7cae6b..33c5f0ef 100644
+--- a/sql/sql_class.cc
++++ b/sql/sql_class.cc
+@@ -599,6 +599,7 @@ THD::THD(bool enable_plugins)
+ 
+   m_internal_handler = nullptr;
+   m_binlog_invoker = false;
++  thr_cond_lock_inited = false;
+   memset(&m_invoker_user, 0, sizeof(m_invoker_user));
+   memset(&m_invoker_host, 0, sizeof(m_invoker_host));
+ 
+@@ -1218,6 +1219,10 @@ THD::~THD() {
+ 
+   mysql_cond_destroy(&COND_thr_lock);
+   mysql_cond_destroy(&COND_group_replication_connection_cond_var);
++  if (thr_cond_lock_inited) {
++    mysql_cond_destroy(&thr_cond_lock);
++    thr_cond_lock_inited = false;
++  }
+ #ifndef NDEBUG
+   dbug_sentry = THD_SENTRY_GONE;
+ #endif
+diff --git a/sql/sql_class.h b/sql/sql_class.h
+index 9c439296..fe658784 100644
+--- a/sql/sql_class.h
++++ b/sql/sql_class.h
+@@ -2632,6 +2632,10 @@ class THD : public MDL_context_owner,
+   */
+   THD *next_to_commit;
+ 
++  /* For group commit optimization */
++  mysql_cond_t thr_cond_lock;
++  bool thr_cond_lock_inited;
++
+   /**
+     The member is served for marking a query that CREATEs or ALTERs
+     a table declared with a TIMESTAMP column as dependent on
+diff --git a/sql/sql_optimizer.cc b/sql/sql_optimizer.cc
+index 260c0c30..fd33ccb8 100644
+--- a/sql/sql_optimizer.cc
++++ b/sql/sql_optimizer.cc
+@@ -6043,10 +6043,20 @@ static ha_rows get_quick_record_count(THD *thd, JOIN_TAB *tab, ha_rows limit) {
+     keys_to_use.merge(tab->skip_scan_keys);
+     MEM_ROOT temp_mem_root(key_memory_test_quick_select_exec,
+                            thd->variables.range_alloc_block_size);
++
++    table_map const_tables, read_tables;
++    if (tab->join()) {
++      const_tables = tab->join()->found_const_table_map;
++      read_tables = tab->join()->is_executed()
++                        ? (tab->prefix_tables() & ~tab->added_tables())
++                        : const_tables;
++    } else {
++      const_tables = read_tables = 0;
++    }
++
+     int error = test_quick_select(
+-        thd, thd->mem_root, &temp_mem_root, keys_to_use, 0,
+-        0,  // empty table_map
+-        limit,
++        thd, thd->mem_root, &temp_mem_root, keys_to_use, const_tables,
++        read_tables, limit,
+         false,  // don't force quick range
+         ORDER_NOT_RELEVANT, tab->table(), tab->skip_records_in_range(),
+         tab->join_cond() ? tab->join_cond() : tab->join()->where_cond,
+diff --git a/storage/innobase/handler/ha_innodb.cc b/storage/innobase/handler/ha_innodb.cc
+index 771856cf..9112822d 100644
+--- a/storage/innobase/handler/ha_innodb.cc
++++ b/storage/innobase/handler/ha_innodb.cc
+@@ -19922,11 +19922,11 @@ int ha_innobase::external_lock(THD *thd, /*!< in: handle to the user thread */
+ 
+     } else if (trx->isolation_level <= TRX_ISO_READ_COMMITTED &&
+                MVCC::is_view_active(trx->read_view)) {
+-      mutex_enter(&trx_sys->mutex);
+-
+-      trx_sys->mvcc->view_close(trx->read_view, true);
+-
+-      mutex_exit(&trx_sys->mutex);
++      /*
++       * Candidate optimization, not sure if it is ok to remove trx sys mutex
++       * here in theory
++       */
++      trx_sys->mvcc->view_close(trx->read_view, false);
+     }
+   }
+ 
+@@ -20525,11 +20525,11 @@ THR_LOCK_DATA **ha_innobase::store_lock(
+       /* At low transaction isolation levels we let
+       each consistent read set its own snapshot */
+ 
+-      mutex_enter(&trx_sys->mutex);
+-
+-      trx_sys->mvcc->view_close(trx->read_view, true);
+-
+-      mutex_exit(&trx_sys->mutex);
++      /*
++       * Candidate optimization, not sure if it is ok to remove trx sys mutex
++       * here in theory
++       */
++      trx_sys->mvcc->view_close(trx->read_view, false);
+     }
+   }
+ 
+diff --git a/storage/innobase/include/read0types.h b/storage/innobase/include/read0types.h
+index ace24c83..8a48849b 100644
+--- a/storage/innobase/include/read0types.h
++++ b/storage/innobase/include/read0types.h
+@@ -45,6 +45,9 @@ class MVCC;
+ /** Read view lists the trx ids of those transactions for which a consistent
+ read should not see the modifications to the database. */
+ 
++#define MAX_TOP_ACTIVE_BYTES 8192
++#define MAX_SHORT_ACTIVE_BYTES 65536
++
+ class ReadView {
+   /** This is similar to a std::vector but it is not a drop
+   in replacement. It is specific to ReadView. */
+@@ -172,14 +175,33 @@ class ReadView {
+ 
+     if (id >= m_low_limit_id) {
+       return (false);
+-
+-    } else if (m_ids.empty()) {
++    } else if (empty()) {
+       return (true);
+     }
+ 
+-    const ids_t::value_type *p = m_ids.data();
++    /* first search short bitmap */
++    if (m_has_short_actives && id >= m_short_min_id) {
++      if (id > m_short_max_id) {
++        return false;
++      }
++      unsigned int trim_id = id & 0x7FFFF;
++      unsigned int trim_min_id = m_short_min_id & 0x7FFFF;
++      unsigned int array_index = (trim_id >> 3);
++      unsigned int array_min_index = (trim_min_id >> 3);
++      array_index = (MAX_SHORT_ACTIVE_BYTES + array_index - array_min_index) %
++                    MAX_TOP_ACTIVE_BYTES;
++      unsigned int array_remainder = trim_id & (0x7);
++      int is_value_set = top_active[array_index] & (1 << (7 - array_remainder));
++      if (is_value_set) {
++        return false;
++      } else {
++        return true;
++      }
++    }
++
++    const ids_t::value_type *p = m_long_ids.data();
+ 
+-    return (!std::binary_search(p, p + m_ids.size(), id));
++    return (!std::binary_search(p, p + m_long_ids.size(), id));
+   }
+ 
+   /**
+@@ -234,7 +256,18 @@ class ReadView {
+ 
+   /**
+   @return true if there are no transaction ids in the snapshot */
+-  bool empty() const { return (m_ids.empty()); }
++  bool empty() const {
++    bool long_empty = m_long_ids.empty();
++    if (long_empty) {
++      if (!m_has_short_actives) {
++        return true;
++      } else {
++        return false;
++      }
++    } else {
++      return false;
++    }
++  }
+ 
+   /**
+   Clones a read view object. The resulting read view has identical change
+@@ -261,11 +294,35 @@ class ReadView {
+ 
+   void print(FILE *file) const noexcept {
+     fprintf(file, "Read view low limit trx n:o " TRX_ID_FMT "\n",
+-            low_limit_no());
++        low_limit_no());
+     print_limits(file);
+-    fprintf(file, "Read view individually stored trx ids:\n");
+-    for (ulint i = 0; i < m_ids.size(); i++)
+-      fprintf(file, "Read view trx id " TRX_ID_FMT "\n", m_ids.data()[i]);
++    fprintf(file, "Read view individually stored trx ids, long size:%lu:\n", m_long_ids.size());
++    for (ulint i = 0; i < m_long_ids.size(); i++)
++      fprintf(file, "Read view trx id " TRX_ID_FMT "\n", m_long_ids.data()[i]);
++    if (m_has_short_actives) {
++      fprintf(file, "Read view individually stored short trx ids, m_short_min_id:%lu, m_short_max_id:%lu\n",
++          m_short_min_id, m_short_max_id);
++      ulint max_top_actives = MAX_TOP_ACTIVE_BYTES << 3;
++      unsigned int trim_min_id = m_short_min_id & 0x7FFFF;
++      unsigned int array_min_index = (trim_min_id >> 3);
++      for (ulint i = 0; i < max_top_actives; i++) {
++        trx_id_t id = m_short_min_id + i;
++        if (id <= m_short_max_id) {
++          unsigned int trim_id = id & 0x7FFFF;
++          unsigned int array_index = (trim_id >> 3);
++          array_index = (MAX_SHORT_ACTIVE_BYTES + array_index - array_min_index) %
++            MAX_TOP_ACTIVE_BYTES;
++          unsigned int array_remainder = trim_id & (0x7);
++          int is_value_set =
++            top_active[array_index] & (1 << (7 - array_remainder));
++          if (is_value_set) {
++            fprintf(file, "Read view trx id " TRX_ID_FMT "\n", id);
++          }
++        } else {
++          break;
++        }
++      }
++    }
+   }
+ 
+   bool is_cloned() const noexcept { return (m_cloned); }
+@@ -273,7 +330,9 @@ class ReadView {
+  private:
+   /**
+   Copy the transaction ids from the source vector */
+-  inline void copy_trx_ids(const trx_ids_t &trx_ids);
++  inline void copy_long_trx_ids(const trx_ids_t &trx_ids,
++                                trx_id_t min_short_id);
++  inline void copy_short_trx_ids();
+ 
+   /**
+   Opens a read view where exactly the transactions serialized before this
+@@ -306,6 +365,7 @@ class ReadView {
+   ReadView &operator=(const ReadView &);
+ 
+  private:
++  unsigned char top_active[MAX_TOP_ACTIVE_BYTES];
+   /** The read should not see any transaction with trx id >= this
+   value. In other words, this is the "high water mark". */
+   trx_id_t m_low_limit_id;
+@@ -321,7 +381,7 @@ class ReadView {
+ 
+   /** Set of RW transactions that was active when this snapshot
+   was taken */
+-  ids_t m_ids;
++  ids_t m_long_ids;
+ 
+   /** The view does not need to see the undo logs for transactions
+   whose transaction number is strictly smaller (<) than this value:
+@@ -336,6 +396,10 @@ class ReadView {
+   trx_id_t m_view_low_limit_no;
+ #endif /* UNIV_DEBUG */
+ 
++  trx_id_t m_short_min_id;
++  trx_id_t m_short_max_id;
++  bool m_has_short_actives;
++
+   /** AC-NL-RO transaction view that has been "closed". */
+   bool m_closed;
+ 
+diff --git a/storage/innobase/include/trx0sys.h b/storage/innobase/include/trx0sys.h
+index d978d16b..801a2621 100644
+--- a/storage/innobase/include/trx0sys.h
++++ b/storage/innobase/include/trx0sys.h
+@@ -594,7 +594,11 @@ struct trx_sys_t {
+   take a snapshot of these transactions whose changes are not visible to it.
+   We should remove transactions from the list before committing in memory and
+   releasing locks to ensure right order of removal and consistent snapshot. */
+-  trx_ids_t rw_trx_ids;
++  trx_ids_t long_rw_trx_ids;
++  unsigned char short_rw_trx_ids_bitmap[MAX_SHORT_ACTIVE_BYTES];
++  int short_rw_trx_valid_number;
++  trx_id_t min_short_valid_id;
++  trx_id_t max_short_valid_id;
+ 
+   /** Max trx id of read-write transactions which exist or existed. */
+   std::atomic<trx_id_t> rw_max_trx_id;
+diff --git a/storage/innobase/read/read0read.cc b/storage/innobase/read/read0read.cc
+index 18d07908..dda45fdf 100644
+--- a/storage/innobase/read/read0read.cc
++++ b/storage/innobase/read/read0read.cc
+@@ -316,7 +316,7 @@ ReadView::ReadView()
+     : m_low_limit_id(),
+       m_up_limit_id(),
+       m_creator_trx_id(),
+-      m_ids(),
++      m_long_ids(),
+       m_low_limit_no(),
+       m_cloned(false) {
+   ut_d(::memset(&m_view_list, 0x0, sizeof(m_view_list)));
+@@ -364,30 +364,36 @@ void MVCC::view_add(const ReadView *view) {
+ /**
+ Copy the transaction ids from the source vector */
+ 
+-void ReadView::copy_trx_ids(const trx_ids_t &trx_ids) {
++void ReadView::copy_long_trx_ids(const trx_ids_t &trx_ids,
++                                 trx_id_t min_short_id) {
+   ut_ad(!m_cloned);
+   ut_ad(trx_sys_mutex_own());
+ 
++  bool contained = false;
+   ulint size = trx_ids.size();
+ 
+-  if (m_creator_trx_id > 0) {
+-    ut_ad(size > 0);
+-    --size;
++  if (m_creator_trx_id > 0 && m_creator_trx_id < min_short_id) {
++    if (std::find(trx_ids.begin(), trx_ids.end(), m_creator_trx_id) !=
++        std::end(trx_ids)) {
++      contained = true;
++      ut_ad(size > 0);
++      --size;
++    }
+   }
+ 
+   if (size == 0) {
+-    m_ids.clear();
++    m_long_ids.clear();
+     return;
+   }
+ 
+-  m_ids.reserve(size);
+-  m_ids.resize(size);
++  m_long_ids.reserve(size);
++  m_long_ids.resize(size);
+ 
+-  ids_t::value_type *p = m_ids.data();
++  ids_t::value_type *p = m_long_ids.data();
+ 
+   /* Copy all the trx_ids except the creator trx id */
+ 
+-  if (m_creator_trx_id > 0) {
++  if (contained) {
+     /* Note: We go through all this trouble because it is
+     unclear whether std::vector::resize() will cause an
+     overhead or not. We should test this extensively and
+@@ -408,7 +414,7 @@ void ReadView::copy_trx_ids(const trx_ids_t &trx_ids) {
+ 
+     n = (trx_ids.size() - i - 1) * sizeof(trx_ids_t::value_type);
+ 
+-    ut_ad(i + (n / sizeof(trx_ids_t::value_type)) == m_ids.size());
++    ut_ad(i + (n / sizeof(trx_ids_t::value_type)) == m_long_ids.size());
+ 
+     if (n > 0) {
+       ::memmove(p + i, &trx_ids[i + 1], n);
+@@ -419,7 +425,7 @@ void ReadView::copy_trx_ids(const trx_ids_t &trx_ids) {
+     ::memmove(p, &trx_ids[0], n);
+   }
+ 
+-  m_up_limit_id = m_ids.front();
++  m_up_limit_id = m_long_ids.front();
+ 
+ #ifdef UNIV_DEBUG
+   /* The check is done randomly from time to time, because the check adds
+@@ -453,6 +459,175 @@ void ReadView::copy_trx_ids(const trx_ids_t &trx_ids) {
+ #endif /* UNIV_DEBUG */
+ }
+ 
++static inline trx_id_t find_smallest_short_active_trx_id(
++    unsigned char *short_bitmap, trx_id_t from, trx_id_t to) {
++  if (from > to) {
++    return to;
++  }
++
++  trx_id_t start = from;
++  do {
++    unsigned int trim_id = start & 0x7FFFF;
++    unsigned int array_index = (trim_id >> 3);
++    unsigned int array_remainder = trim_id & (0x7);
++    int is_value_set = short_bitmap[array_index] & (1 << (7 - array_remainder));
++    if (is_value_set) {
++      return start;
++    } else {
++      start++;
++      if (start > to) {
++        return to;
++      }
++    }
++  } while (true);
++}
++
++void ReadView::copy_short_trx_ids() {
++  ut_ad(!m_cloned);
++  ut_ad(trx_sys_mutex_own());
++
++  unsigned char *short_trx_id_bitmap = trx_sys->short_rw_trx_ids_bitmap;
++  unsigned int start = trx_sys->min_short_valid_id & 0x7FFFF;
++  unsigned int end = trx_sys->max_short_valid_id & 0x7FFFF;
++  unsigned int array_index_start = (start >> 3);
++  unsigned int array_index_end = (end >> 3);
++
++  if (array_index_start <= array_index_end) {
++    int diff = array_index_end - array_index_start + 1;
++    if (diff > MAX_TOP_ACTIVE_BYTES) {
++      trx_id_t old_id_start = trx_sys->min_short_valid_id;
++      trx_id_t max_short_valid_id = trx_sys->max_short_valid_id;
++      trx_id_t max_valid_id = max_short_valid_id;
++      max_valid_id = max_valid_id - ((max_valid_id & 0x7));
++      trx_id_t base = max_valid_id - ((MAX_TOP_ACTIVE_BYTES - 1) << 3);
++
++      trx_id_t candidate_min_short_valid_id = find_smallest_short_active_trx_id(
++          short_trx_id_bitmap, base, max_short_valid_id);
++
++      trx_sys->min_short_valid_id = candidate_min_short_valid_id;
++
++      trx_id_t old_id_end = base - 1;
++
++      for (trx_id_t id = old_id_start; id <= old_id_end; id++) {
++        unsigned int trim_id = id & 0x7FFFF;
++        unsigned int array_index = (trim_id >> 3);
++        unsigned int array_remainder = trim_id & (0x7);
++        int is_value_set =
++            short_trx_id_bitmap[array_index] & (1 << (7 - array_remainder));
++        if (is_value_set) {
++          trx_sys->long_rw_trx_ids.push_back(id);
++          trx_sys->short_rw_trx_valid_number--;
++          short_trx_id_bitmap[array_index] &=
++              (255 - (1 << (7 - array_remainder)));
++        }
++      }
++
++      start = candidate_min_short_valid_id & 0x7FFFF;
++      end = max_short_valid_id & 0x7FFFF;
++
++      array_index_start = (start >> 3);
++      array_index_end = (end >> 3);
++      diff = array_index_end - array_index_start + 1;
++
++      ::memmove(top_active, &short_trx_id_bitmap[array_index_start], diff);
++    } else {
++      ::memmove(top_active, &short_trx_id_bitmap[array_index_start], diff);
++    }
++  } else {
++    int diff = MAX_SHORT_ACTIVE_BYTES - array_index_start;
++    int total = diff + array_index_end + 1;
++    if (total > MAX_TOP_ACTIVE_BYTES) {
++      if (array_index_end > MAX_TOP_ACTIVE_BYTES) {
++        trx_id_t max_short_valid_id = trx_sys->max_short_valid_id;
++        trx_id_t max_valid_id = max_short_valid_id;
++        max_valid_id = max_valid_id - ((max_valid_id & 0x7));
++        trx_id_t base = max_valid_id - ((MAX_TOP_ACTIVE_BYTES - 1) << 3);
++        trx_id_t old_id_start = trx_sys->min_short_valid_id;
++        trx_id_t candidate_min_short_valid_id =
++            find_smallest_short_active_trx_id(short_trx_id_bitmap, base,
++                                              max_short_valid_id);
++        trx_sys->min_short_valid_id = candidate_min_short_valid_id;
++
++        trx_id_t old_id_end = base - 1;
++        for (trx_id_t id = old_id_start; id <= old_id_end; id++) {
++          unsigned int trim_id = id & 0x7FFFF;
++          unsigned int array_index = (trim_id >> 3);
++          unsigned int array_remainder = trim_id & (0x7);
++          int is_value_set =
++              short_trx_id_bitmap[array_index] & (1 << (7 - array_remainder));
++          if (is_value_set) {
++            trx_sys->long_rw_trx_ids.push_back(id);
++            trx_sys->short_rw_trx_valid_number--;
++            short_trx_id_bitmap[array_index] &=
++                (255 - (1 << (7 - array_remainder)));
++          }
++        }
++
++        start = candidate_min_short_valid_id & 0x7FFFF;
++        end = max_short_valid_id & 0x7FFFF;
++
++        array_index_start = (start >> 3);
++        array_index_end = (end >> 3);
++        diff = array_index_end - array_index_start + 1;
++
++        ::memmove(top_active, &short_trx_id_bitmap[array_index_start], diff);
++
++      } else {
++        trx_id_t max_short_valid_id = trx_sys->max_short_valid_id;
++        trx_id_t max_valid_id = max_short_valid_id;
++        max_valid_id = max_valid_id - ((max_valid_id & 0x7));
++        trx_id_t base = max_valid_id - ((MAX_TOP_ACTIVE_BYTES - 1) << 3);
++        trx_id_t old_id_start = trx_sys->min_short_valid_id;
++        trx_id_t candidate_min_short_valid_id =
++            find_smallest_short_active_trx_id(short_trx_id_bitmap, base,
++                                              max_short_valid_id);
++        trx_sys->min_short_valid_id = candidate_min_short_valid_id;
++
++        trx_id_t old_id_end = base - 1;
++
++        for (trx_id_t id = old_id_start; id <= old_id_end; id++) {
++          unsigned int trim_id = id & 0x7FFFF;
++          unsigned int array_index = (trim_id >> 3);
++          unsigned int array_remainder = trim_id & (0x7);
++          int is_value_set =
++              short_trx_id_bitmap[array_index] & (1 << (7 - array_remainder));
++          if (is_value_set) {
++            trx_sys->long_rw_trx_ids.push_back(id);
++            trx_sys->short_rw_trx_valid_number--;
++            short_trx_id_bitmap[array_index] &=
++                (255 - (1 << (7 - array_remainder)));
++          }
++        }
++
++        start = candidate_min_short_valid_id & 0x7FFFF;
++        end = max_short_valid_id & 0x7FFFF;
++
++        array_index_start = (start >> 3);
++        array_index_end = (end >> 3);
++
++        if (array_index_start <= array_index_end) {
++          diff = array_index_end - array_index_start + 1;
++          ::memmove(top_active, &short_trx_id_bitmap[array_index_start], diff);
++        } else {
++          diff = MAX_SHORT_ACTIVE_BYTES - array_index_start;
++          unsigned char *p = top_active;
++          ::memmove(p, &short_trx_id_bitmap[array_index_start], diff);
++          p += diff;
++          ::memmove(p, &short_trx_id_bitmap[0], array_index_end + 1);
++        }
++      }
++    } else {
++      unsigned char *p = top_active;
++      ::memmove(p, &short_trx_id_bitmap[array_index_start], diff);
++      p += diff;
++      ::memmove(p, &short_trx_id_bitmap[0], array_index_end + 1);
++    }
++  }
++
++  m_short_min_id = trx_sys->min_short_valid_id;
++  m_short_max_id = trx_sys->max_short_valid_id;
++}
++
+ /**
+ Opens a read view where exactly the transactions serialized before this
+ point in time are seen in the view.
+@@ -470,14 +645,29 @@ void ReadView::prepare(trx_id_t id) {
+ 
+   ut_a(m_low_limit_no <= m_low_limit_id);
+ 
+-  if (!trx_sys->rw_trx_ids.empty()) {
+-    copy_trx_ids(trx_sys->rw_trx_ids);
++  if (trx_sys->short_rw_trx_valid_number) {
++    copy_short_trx_ids();
++    m_has_short_actives = true;
+   } else {
+-    m_ids.clear();
++    m_has_short_actives = false;
++  }
++
++  if (!trx_sys->long_rw_trx_ids.empty()) {
++    copy_long_trx_ids(trx_sys->long_rw_trx_ids, trx_sys->min_short_valid_id);
++  } else {
++    m_long_ids.clear();
+   }
+ 
+   /* The first active transaction has the smallest id. */
+-  m_up_limit_id = !m_ids.empty() ? m_ids.front() : m_low_limit_id;
++  if (!m_long_ids.empty()) {
++    m_up_limit_id = m_long_ids.front();
++  } else {
++    if (trx_sys->short_rw_trx_valid_number) {
++      m_up_limit_id = trx_sys->min_short_valid_id;
++    } else {
++      m_up_limit_id = m_low_limit_id;
++    }
++  }
+ 
+   ut_a(m_up_limit_id <= m_low_limit_id);
+ 
+@@ -636,12 +826,33 @@ Copy state from another view. Must call copy_complete() to finish.
+ void ReadView::copy_prepare(const ReadView &other) {
+   ut_ad(&other != this);
+ 
+-  if (!other.m_ids.empty()) {
+-    const ids_t::value_type *p = other.m_ids.data();
++  if (other.m_has_short_actives) {
++    unsigned int max_trim_id = other.m_short_max_id & 0x7FFFF;
++    unsigned int min_trim_id = other.m_short_min_id & 0x7FFFF;
++    unsigned int max_array_index = (max_trim_id >> 3);
++    unsigned int min_array_index = (min_trim_id >> 3);
++    int diff =
++        (MAX_SHORT_ACTIVE_BYTES + max_array_index - min_array_index + 1) %
++        MAX_TOP_ACTIVE_BYTES;
++    if (diff == 0) {
++      diff = MAX_TOP_ACTIVE_BYTES;
++    }
++
++    ::memmove(top_active, other.top_active, diff);
++    m_has_short_actives = true;
++    m_short_min_id = other.m_short_min_id;
++    m_short_max_id = other.m_short_max_id;
+ 
+-    m_ids.assign(p, p + other.m_ids.size());
+   } else {
+-    m_ids.clear();
++    m_has_short_actives = false;
++  }
++
++  if (!other.m_long_ids.empty()) {
++    const ids_t::value_type *p = other.m_long_ids.data();
++
++    m_long_ids.assign(p, p + other.m_long_ids.size());
++  } else {
++    m_long_ids.clear();
+   }
+ 
+   m_up_limit_id = other.m_up_limit_id;
+@@ -663,12 +874,27 @@ void ReadView::copy_complete() {
+   ut_ad(!trx_sys_mutex_own());
+ 
+   if (m_creator_trx_id > 0) {
+-    m_ids.insert(m_creator_trx_id);
++    if (m_short_min_id <= m_creator_trx_id) {
++      unsigned int trim_id = m_creator_trx_id & 0x7FFFF;
++      unsigned int trim_min_id = m_short_min_id & 0x7FFFF;
++      unsigned int array_index = (trim_id >> 3);
++      unsigned int array_min_index = (trim_min_id >> 3);
++      array_index = (MAX_SHORT_ACTIVE_BYTES + array_index - array_min_index) %
++                    MAX_TOP_ACTIVE_BYTES;
++      unsigned int array_remainder = trim_id & (0x7);
++      top_active[array_index] |= (1 << (7 - array_remainder));
++    } else {
++      m_long_ids.insert(m_creator_trx_id);
++    }
+   }
+ 
+-  if (!m_ids.empty()) {
++  if (!m_long_ids.empty()) {
+     /* The last active transaction has the smallest id. */
+-    m_up_limit_id = std::min(m_ids.front(), m_up_limit_id);
++    m_up_limit_id = std::min(m_long_ids.front(), m_up_limit_id);
++  } else {
++    if (m_has_short_actives) {
++      m_up_limit_id = std::min(m_short_min_id, m_up_limit_id);
++    }
+   }
+ 
+   ut_ad(m_up_limit_id <= m_low_limit_id);
+diff --git a/storage/innobase/trx/trx0sys.cc b/storage/innobase/trx/trx0sys.cc
+index 73eefa8a..8f412c04 100644
+--- a/storage/innobase/trx/trx0sys.cc
++++ b/storage/innobase/trx/trx0sys.cc
+@@ -610,7 +610,7 @@ void trx_sys_create(void) {
+ 
+   ut_d(trx_sys->rw_max_trx_no = 0);
+ 
+-  new (&trx_sys->rw_trx_ids)
++  new (&trx_sys->long_rw_trx_ids)
+       trx_ids_t(ut::allocator<trx_id_t>(mem_key_trx_sys_t_rw_trx_ids));
+ 
+   for (auto &shard : trx_sys->shards) {
+@@ -686,7 +686,7 @@ void trx_sys_close(void) {
+   mutex_free(&trx_sys->serialisation_mutex);
+   mutex_free(&trx_sys->mutex);
+ 
+-  trx_sys->rw_trx_ids.~trx_ids_t();
++  trx_sys->long_rw_trx_ids.~trx_ids_t();
+ 
+   ut::free(trx_sys);
+ 
+diff --git a/storage/innobase/trx/trx0trx.cc b/storage/innobase/trx/trx0trx.cc
+index b7ac68ed..8d14350e 100644
+--- a/storage/innobase/trx/trx0trx.cc
++++ b/storage/innobase/trx/trx0trx.cc
+@@ -1065,7 +1065,10 @@ void trx_lists_init_at_db_start(void) {
+ 
+     if (trx->state.load(std::memory_order_relaxed) == TRX_STATE_ACTIVE ||
+         trx->state.load(std::memory_order_relaxed) == TRX_STATE_PREPARED) {
+-      trx_sys->rw_trx_ids.push_back(trx->id);
++      trx_sys->long_rw_trx_ids.push_back(trx->id);
++      if (trx->id >= trx_sys->min_short_valid_id) {
++        trx_sys->min_short_valid_id = trx->id + 1;
++      }
+     }
+     trx_add_to_rw_trx_list(trx);
+   }
+@@ -1224,6 +1227,41 @@ void trx_assign_rseg_durable(trx_t *trx) {
+   trx->rsegs.m_redo.rseg = srv_read_only_mode ? nullptr : get_next_redo_rseg();
+ }
+ 
++static inline void update_short_bitmamp(unsigned char *short_bitmap,
++                                        trx_id_t id, bool is_set_value) {
++  unsigned int trim_id = id & 0x7FFFF;
++  unsigned int array_index = (trim_id >> 3);
++  unsigned int array_remainder = trim_id & (0x7);
++  if (is_set_value) {
++    short_bitmap[array_index] |= (1 << (7 - array_remainder));
++  } else {
++    short_bitmap[array_index] &= (255 - (1 << (7 - array_remainder)));
++  }
++}
++
++static inline trx_id_t find_smallest_short_active_trx_id(
++    unsigned char *short_bitmap, trx_id_t from, trx_id_t to) {
++  if (from > to) {
++    return to;
++  }
++
++  trx_id_t start = from;
++  do {
++    unsigned int trim_id = start & 0x7FFFF;
++    unsigned int array_index = (trim_id >> 3);
++    unsigned int array_remainder = trim_id & (0x7);
++    int is_value_set = short_bitmap[array_index] & (1 << (7 - array_remainder));
++    if (is_value_set) {
++      return start;
++    } else {
++      start++;
++      if (start > to) {
++        return to;
++      }
++    }
++  } while (true);
++}
++
+ /** Assign an id for this RW transaction and insert it into trx_sys->rw_trx_ids
+ @param trx	transaction to assign an id for */
+ static void trx_assign_id_for_rw(trx_t *trx) {
+@@ -1232,14 +1270,58 @@ static void trx_assign_id_for_rw(trx_t *trx) {
+   trx->id =
+       trx->preallocated_id ? trx->preallocated_id : trx_sys_allocate_trx_id();
+ 
+-  if (trx->preallocated_id) {
+-    // preallocated_id might not be received in ascending order,
+-    // so we need to maintain ordering in rw_trx_ids and update min_active_trx_id
+-    auto upper_bound_it = std::upper_bound(trx_sys->rw_trx_ids.begin(), trx_sys->rw_trx_ids.end(), trx->id);
+-    trx_sys->rw_trx_ids.insert(upper_bound_it, trx->id);
++  if (trx->id < trx_sys->min_short_valid_id) {
++    if (trx->preallocated_id) {
++      // preallocated_id might not be received in ascending order,
++      // so we need to maintain ordering in rw_trx_ids and update
++      // min_active_trx_id
++      auto upper_bound_it =
++          std::upper_bound(trx_sys->long_rw_trx_ids.begin(),
++                           trx_sys->long_rw_trx_ids.end(), trx->id);
++      trx_sys->long_rw_trx_ids.insert(upper_bound_it, trx->id);
++    } else {
++      // The id is known to be greatest
++      trx_sys->long_rw_trx_ids.push_back(trx->id);
++    }
+   } else {
+-    // The id is known to be greatest
+-    trx_sys->rw_trx_ids.push_back(trx->id);
++    if (trx_sys->short_rw_trx_valid_number == 0) {
++      trx_sys->min_short_valid_id = trx->id;
++    }
++    if (trx->id > trx_sys->max_short_valid_id) {
++      trx_sys->max_short_valid_id = trx->id;
++    }
++
++    int64_t diff = trx_sys->max_short_valid_id - trx_sys->min_short_valid_id;
++    if (diff < (MAX_SHORT_ACTIVE_BYTES << 3)) {
++      update_short_bitmamp(trx_sys->short_rw_trx_ids_bitmap, trx->id, true);
++    } else {
++      trx_id_t old_id_start = trx_sys->min_short_valid_id;
++      trx_id_t max_short_valid_id = trx_sys->max_short_valid_id;
++      trx_id_t max_valid_id = max_short_valid_id;
++      max_valid_id = max_valid_id - ((max_valid_id & 0x7));
++      trx_id_t base = max_valid_id - ((MAX_SHORT_ACTIVE_BYTES - 1) << 3);
++
++      unsigned char *short_trx_id_bitmap = trx_sys->short_rw_trx_ids_bitmap;
++      trx_sys->min_short_valid_id = find_smallest_short_active_trx_id(
++          short_trx_id_bitmap, base, max_short_valid_id);
++
++      trx_id_t old_id_end = base - 1;
++
++      for (trx_id_t id = old_id_start; id <= old_id_end; id++) {
++        unsigned int trim_id = id & 0x7FFFF;
++        unsigned int array_index = (trim_id >> 3);
++        unsigned int array_remainder = trim_id & (0x7);
++        int is_value_set =
++            short_trx_id_bitmap[array_index] & (1 << (7 - array_remainder));
++        if (is_value_set) {
++          trx_sys->long_rw_trx_ids.push_back(id);
++          trx_sys->short_rw_trx_valid_number--;
++          short_trx_id_bitmap[array_index] &=
++              (255 - (1 << (7 - array_remainder)));
++        }
++      }
++    }
++    trx_sys->short_rw_trx_valid_number++;
+   }
+ }
+ 
+@@ -1799,11 +1881,59 @@ static void trx_erase_lists(trx_t *trx) {
+   ut_ad(trx->id > 0);
+   ut_ad(trx_sys_mutex_own());
+ 
+-  trx_ids_t::iterator it = std::lower_bound(trx_sys->rw_trx_ids.begin(),
+-                                            trx_sys->rw_trx_ids.end(), trx->id);
++  trx_id_t min_short_valid_id = trx_sys->min_short_valid_id;
++  trx_id_t max_short_valid_id = trx_sys->max_short_valid_id;
++
++  if (trx->id < min_short_valid_id) {
++    trx_ids_t::iterator it =
++        std::lower_bound(trx_sys->long_rw_trx_ids.begin(),
++                         trx_sys->long_rw_trx_ids.end(), trx->id);
+ 
+-  ut_ad(*it == trx->id);
+-  trx_sys->rw_trx_ids.erase(it);
++    ut_ad(*it == trx->id);
++    trx_sys->long_rw_trx_ids.erase(it);
++  } else {
++    trx_sys->short_rw_trx_valid_number--;
++    int short_rw_trx_valid_number = trx_sys->short_rw_trx_valid_number;
++    update_short_bitmamp(trx_sys->short_rw_trx_ids_bitmap, trx->id, false);
++    if (short_rw_trx_valid_number > 0) {
++      if (trx->id == min_short_valid_id) {
++        trx_id_t candidate_min_short_valid_id =
++            find_smallest_short_active_trx_id(trx_sys->short_rw_trx_ids_bitmap,
++                                              min_short_valid_id + 1,
++                                              max_short_valid_id);
++        trx_sys->min_short_valid_id = candidate_min_short_valid_id;
++      } else {
++        int64_t diff = max_short_valid_id - min_short_valid_id;
++        if (diff >= MAX_SHORT_ACTIVE_BYTES) {
++          trx_id_t old_id_start = min_short_valid_id;
++          trx_id_t max_valid_id = max_short_valid_id;
++          max_valid_id = max_valid_id - ((max_valid_id & 0x7));
++          trx_id_t base =
++              max_valid_id - (((MAX_SHORT_ACTIVE_BYTES >> 3) - 1) << 3);
++
++          unsigned char *short_trx_id_bitmap = trx_sys->short_rw_trx_ids_bitmap;
++          trx_sys->min_short_valid_id = find_smallest_short_active_trx_id(
++              short_trx_id_bitmap, base, max_short_valid_id);
++
++          trx_id_t old_id_end = base - 1;
++
++          for (trx_id_t id = old_id_start; id <= old_id_end; id++) {
++            unsigned int trim_id = id & 0x7FFFF;
++            unsigned int array_index = (trim_id >> 3);
++            unsigned int array_remainder = trim_id & (0x7);
++            int is_value_set =
++                short_trx_id_bitmap[array_index] & (1 << (7 - array_remainder));
++            if (is_value_set) {
++              trx_sys->long_rw_trx_ids.push_back(id);
++              trx_sys->short_rw_trx_valid_number--;
++              short_trx_id_bitmap[array_index] &=
++                  (255 - (1 << (7 - array_remainder)));
++            }
++          }
++        }
++      }
++    }
++  }
+ 
+   if (trx->read_only || trx->rsegs.m_redo.rseg == nullptr) {
+     ut_ad(!trx->in_rw_trx_list);
