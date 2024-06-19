@@ -1,7 +1,7 @@
-# Refer to my.cnf_base_for_test for semisynchronous replication
+# Refer to my.cnf_master_for_asyn_mgr_semi and my.cnf_slave_for_asyn_mgr_semi for semisynchronous replication
+# my.cnf_master_for_asyn_mgr_semi for MySQL primary and my.cnf_slave_for_asyn_mgr_semi for MySQL secondary
 
 # How to run semisynchronous replication
-
 # MySQL primary
 INSTALL PLUGIN rpl_semi_sync_source SONAME 'semisync_source.so';
 SET GLOBAL rpl_semi_sync_source_enabled = 1;
