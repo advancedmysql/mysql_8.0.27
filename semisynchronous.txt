@@ -1,4 +1,6 @@
-# For semisynchronous replication
+# Refer to my.cnf_base_for_test for semisynchronous replication
+
+# How to run semisynchronous replication
 
 # MySQL primary
 INSTALL PLUGIN rpl_semi_sync_source SONAME 'semisync_source.so';
