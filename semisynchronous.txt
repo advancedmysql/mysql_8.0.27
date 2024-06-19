@@ -1,0 +1,12 @@
+# For semisynchronous replication
+
+# MySQL primary
+INSTALL PLUGIN rpl_semi_sync_source SONAME 'semisync_source.so';
+SET GLOBAL rpl_semi_sync_source_enabled = 1;
+
+# MySQL secondary
+INSTALL PLUGIN rpl_semi_sync_replica SONAME 'semisync_replica.so';
+SET GLOBAL rpl_semi_sync_replica_enabled = 1;
+stop slave;
+change master to master_host='127.0.0.1',master_port=63306,master_user='test',master_password='xxx',master_auto_position =  1;
+start slave;
